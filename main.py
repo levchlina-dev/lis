@@ -1,10 +1,13 @@
 import sys
+from dotenv import load_dotenv
+
+load_dotenv()
 
 
 def main() -> None:
     if len(sys.argv) < 2:
         print("Usage: python main.py <channel>")
-        print("Channels: cli, http")
+        print("Channels: cli, http, telegram")
         sys.exit(1)
 
     channel = sys.argv[1].lower()
@@ -21,9 +24,13 @@ def main() -> None:
         print(f"Starting HTTP channel on http://{host}:{port}")
         uvicorn.run(app, host=host, port=port)
 
+    elif channel == "telegram":
+        from channels.telegram import run
+        run()
+
     else:
         print(f"Unknown channel: {channel!r}")
-        print("Available channels: cli, http")
+        print("Available channels: cli, http, telegram")
         sys.exit(1)
 
 
