@@ -1,17 +1,19 @@
 import subprocess
 import os
 import anthropic
+from typing import Callable
 
 client = anthropic.Anthropic()
 
 SYSTEM_PROMPT = """You are a helpful PC agent. You can perform multi-step tasks on the user's computer.
 Use tools step by step to complete tasks. Think before each action.
-Always explain what you are doing and why. Be careful with destructive operations."""
+Always reply in the same language the user writes in.
+Be concise when reporting results."""
 
 TOOLS = [
     {
         "name": "bash",
-        "description": "Run a shell command and return the output. Use for any system operations.",
+        "description": "Run a shell command and return the output.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -26,7 +28,7 @@ TOOLS = [
         "input_schema": {
             "type": "object",
             "properties": {
-                "path": {"type": "string", "description": "Absolute or relative file path"},
+                "path": {"type": "string", "description": "File path"},
             },
             "required": ["path"],
         },
@@ -49,28 +51,19 @@ TOOLS = [
         "input_schema": {
             "type": "object",
             "properties": {
-                "path": {"type": "string", "description": "Directory path (default: current dir)"},
+                "path": {"type": "string", "description": "Directory path (default: current)"},
             },
             "required": [],
         },
     },
 ]
 
-DANGER_KEYWORDS = ("rm -rf", "format", "mkfs", "dd if=", ":(){", "shutdown", "reboot", "del /f")
+DANGER_KEYWORDS = ("rm -rf", "format", "mkfs", "dd if=", ":(){", "shutdown", "reboot")
 
 
-def _confirm(action: str, detail: str) -> bool:
-    print(f"\n⚡ {action}: {detail}")
-    answer = input("   Разрешить? [y/N]: ").strip().lower()
-    return answer == "y"
-
-
-def _run_tool(name: str, inputs: dict) -> str:
+def _execute_tool(name: str, inputs: dict) -> str:
     if name == "bash":
         cmd = inputs["command"]
-        if any(kw in cmd for kw in DANGER_KEYWORDS):
-            if not _confirm("ОПАСНАЯ команда", cmd):
-                return "Отменено пользователем."
         try:
             result = subprocess.run(
                 cmd, shell=True, capture_output=True, text=True, timeout=30
@@ -78,7 +71,7 @@ def _run_tool(name: str, inputs: dict) -> str:
             output = result.stdout + result.stderr
             return output.strip() or "(нет вывода)"
         except subprocess.TimeoutExpired:
-            return "Ошибка: команда выполнялась дольше 30 секунд."
+            return "Ошибка: превышено время ожидания (30с)"
         except Exception as e:
             return f"Ошибка: {e}"
 
@@ -90,10 +83,8 @@ def _run_tool(name: str, inputs: dict) -> str:
             return f"Ошибка чтения: {e}"
 
     elif name == "write_file":
-        path = inputs["path"]
-        if not _confirm("Запись файла", path):
-            return "Отменено пользователем."
         try:
+            path = inputs["path"]
             os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
             with open(path, "w", encoding="utf-8") as f:
                 f.write(inputs["content"])
@@ -104,17 +95,39 @@ def _run_tool(name: str, inputs: dict) -> str:
     elif name == "list_dir":
         path = inputs.get("path", ".")
         try:
-            entries = os.listdir(path)
-            return "\n".join(sorted(entries)) or "(пусто)"
+            entries = sorted(os.listdir(path))
+            return "\n".join(entries) or "(пусто)"
         except Exception as e:
             return f"Ошибка: {e}"
 
     return f"Неизвестный инструмент: {name}"
 
 
-def run_task(task: str) -> None:
+def run_agent(
+    task: str,
+    on_update: Callable[[str, str], None] | None = None,
+) -> None:
+    """
+    Run the PC agent on a task.
+    on_update(type, content) is called for each event:
+      type = "text"   — agent text output
+      type = "tool"   — tool call (name + input)
+      type = "result" — tool result
+      type = "done"   — agent finished
+    """
+    def notify(type_: str, content: str) -> None:
+        if on_update:
+            on_update(type_, content)
+        else:
+            # CLI fallback
+            if type_ == "text":
+                print(f"Агент: {content}")
+            elif type_ == "tool":
+                print(f"🔧 {content}")
+            elif type_ == "result":
+                print(f"   → {content[:300]}")
+
     messages = [{"role": "user", "content": task}]
-    print()
 
     while True:
         response = client.messages.create(
@@ -129,23 +142,27 @@ def run_task(task: str) -> None:
             messages=messages,
         )
 
-        # Print text blocks as they appear
         for block in response.content:
             if block.type == "text" and block.text.strip():
-                print(f"Агент: {block.text}\n")
+                notify("text", block.text.strip())
 
         messages.append({"role": "assistant", "content": response.content})
 
         if response.stop_reason == "end_turn":
+            notify("done", "")
             break
 
         if response.stop_reason == "tool_use":
             tool_results = []
             for block in response.content:
                 if block.type == "tool_use":
-                    print(f"🔧 Инструмент: {block.name}({block.input})")
-                    result = _run_tool(block.name, block.input)
-                    print(f"   → {result[:200]}{'...' if len(result) > 200 else ''}\n")
+                    is_dangerous = any(k in str(block.input) for k in DANGER_KEYWORDS)
+                    label = "⚠️ " if is_dangerous else ""
+                    notify("tool", f"{label}{block.name}: {block.input}")
+
+                    result = _execute_tool(block.name, block.input)
+                    notify("result", result)
+
                     tool_results.append({
                         "type": "tool_result",
                         "tool_use_id": block.id,
@@ -153,6 +170,8 @@ def run_task(task: str) -> None:
                     })
             messages.append({"role": "user", "content": tool_results})
 
+
+# ── CLI mode ──────────────────────────────────────────────────────────────────
 
 def run() -> None:
     print("PC Агент запущен. Введите задачу или 'exit' для выхода.\n")
@@ -164,6 +183,6 @@ def run() -> None:
             break
         if task.lower() in ("exit", "quit", "q"):
             break
-        if not task:
-            continue
-        run_task(task)
+        if task:
+            run_agent(task)
+            print()
