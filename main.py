@@ -28,9 +28,13 @@ def main() -> None:
         from channels.telegram import run
         run()
 
+    elif channel == "pc":
+        from channels.pc import run
+        run()
+
     else:
         print(f"Unknown channel: {channel!r}")
-        print("Available channels: cli, http, telegram")
+        print("Available channels: cli, http, telegram, pc")
         sys.exit(1)
 
 
